@@ -1,0 +1,7 @@
+{
+  "name": "Mad App",
+  "description": "An application to create, find, and save recipes. Users can collaborate, rate recipes, and mark their favorites. The design is inspired by simple, clean Nordic aesthetics.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
