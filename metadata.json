@@ -1,0 +1,7 @@
+{
+  "name": "Mad App",
+  "description": "En app til at oprette, dele og gemme opskrifter med venner og familie. Bedøm opskrifter, gem favoritter og find nemt inspiration til dit næste måltid.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
