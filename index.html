@@ -13,22 +13,20 @@
         }
     </style>
     <script type="importmap">
-{
-  "imports": {
-    "react": "https://esm.sh/react@18.3.1",
-    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
-    "react-router-dom": "https://esm.sh/react-router-dom@6.24.1",
-    "react-dom/": "https://esm.sh/react-dom@^19.1.0/",
-    "react/": "https://esm.sh/react@^19.1.0/"
-  }
-}
-</script>
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.3.1",
+        "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+        "react-router-dom": "https://esm.sh/react-router-dom@6.24.1"
+      }
+    }
+    </script>
     <!-- Add Babel to transpile JSX/TSX in the browser -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
 <body class="bg-[#0f2d32] text-[#ffffff]">
     <div id="root"></div>
-    <script type="text/babel" data-type="module">
+    <script type="text/babel" data-type="module" data-presets="react,typescript">
         import React, { useState, useEffect, useMemo, ChangeEvent, FormEvent, createContext, useReducer, ReactNode, useContext } from 'react';
         import ReactDOM from 'react-dom/client';
         import { HashRouter, Routes, Route, Link, useNavigate, useParams, useLocation } from 'react-router-dom';
@@ -251,7 +249,9 @@
                 dispatch({ type: 'LOAD_STATE', payload: parsedState });
               } else {
                 // On first load, set a default user
-                dispatch({ type: 'SET_CURRENT_USER', payload: initialUsers[0] });
+                if (initialUsers.length > 0) {
+                    dispatch({ type: 'SET_CURRENT_USER', payload: initialUsers[0] });
+                }
               }
             } catch (error) {
               console.error("Could not load state from localStorage", error);
