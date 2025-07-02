@@ -1,0 +1,647 @@
+
+<!DOCTYPE html>
+<html lang="da">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BTMad App</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              'primary': '#0f2d32',
+              'accent': '#75fb9e',
+              'light': '#ffffff',
+            },
+            fontFamily: {
+                sans: ['Inter', 'sans-serif'],
+            }
+          }
+        }
+      }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="stylesheet">
+    
+    <!-- React and Babel for in-browser transpilation -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Google API Scripts -->
+    <script async defer src="https://apis.google.com/js/api.js"></script>
+    <script async defer src="https://accounts.google.com/gsi/client"></script>
+
+</head>
+<body class="bg-primary text-light">
+    <div id="root"></div>
+    
+    <script type="text/babel" data-presets="react,typescript">
+// =================================================================================
+// TYPE DEFINITIONS
+// =================================================================================
+enum Page {
+    Welcome,
+    FindRecipe,
+    RecipeDetail,
+    CreateRecipe,
+    User,
+    Admin
+}
+
+interface Rating {
+    userId: string;
+    score: number;
+}
+
+interface Ingredient {
+    id: string;
+    name: string;
+    amount: string;
+}
+
+interface Recipe {
+    id: string;
+    title: string;
+    images: string[];
+    prepTime: number; // in minutes
+    ingredients: Ingredient[];
+    instructions: string;
+    notes?: string;
+    categoryIds: string[];
+    authorId: string;
+    ratings: Rating[];
+}
+
+interface User {
+    id: string;
+    name: string;
+    avatar: string;
+    favorites: string[];
+}
+
+interface Category {
+    id: string;
+    name: string;
+}
+
+interface Filter {
+    category: string;
+    time: string;
+}
+
+interface DataBundle {
+    recipes: Recipe[];
+    users: User[];
+    categories: Category[];
+}
+
+
+// =================================================================================
+// GOOGLE DRIVE SERVICE
+// =================================================================================
+namespace driveService {
+    // Type definitions for Google API and Identity Services to fix compile errors
+    declare var gapi: any;
+    declare var google: any;
+
+    const DISCOVERY_DOC = 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest';
+    const SCOPES = 'https://www.googleapis.com/auth/drive.file';
+    const DATA_FILE_NAME = 'BTMad.data.json';
+
+    let tokenClient: any;
+    let config = { apiKey: '', clientId: '' };
+
+    export const configure = (newConfig: { apiKey: string, clientId: string }) => {
+        config = newConfig;
+    };
+
+    const gapiInit = () => new Promise<void>((resolve, reject) => {
+        if (!config.apiKey) return reject("API Key not configured");
+        gapi.load('client', () => {
+            gapi.client.init({
+                apiKey: config.apiKey,
+                discoveryDocs: [DISCOVERY_DOC],
+            }).then(resolve).catch(reject);
+        });
+    });
+
+    const gsiInit = () => new Promise<void>((resolve, reject) => {
+        if (!config.clientId) return reject("Client ID not configured");
+        tokenClient = google.accounts.oauth2.initTokenClient({
+            client_id: config.clientId,
+            scope: SCOPES,
+            callback: () => {},
+        });
+        resolve();
+    });
+
+    export const initClient = async (callback: (isLoggedIn: boolean) => void) => {
+        await Promise.all([gapiInit(), gsiInit()]);
+        callback(gapi.client.getToken() !== null);
+    };
+
+    export const requestToken = (onTokenReceived: () => void) => {
+        if (gapi.client.getToken() !== null) {
+            onTokenReceived();
+            return;
+        }
+        tokenClient.callback = (resp: any) => {
+          if (resp.error) throw (resp);
+          onTokenReceived();
+        };
+        tokenClient.requestAccessToken({prompt: 'consent'});
+    };
+    
+    export const findOrCreateDataFile = async (): Promise<{ fileId: string; data: DataBundle | null }> => {
+        const response = await gapi.client.drive.files.list({
+            q: `name='${DATA_FILE_NAME}' and trashed=false`,
+            fields: 'files(id, name)',
+            spaces: 'drive',
+        });
+        if (response.result.files && response.result.files.length > 0) {
+            const fileId = response.result.files[0].id!;
+            const fileContent = await readFile(fileId);
+            return { fileId, data: fileContent };
+        } else {
+            const fileMetadata = { name: DATA_FILE_NAME, mimeType: 'application/json' };
+            const initialContent: DataBundle = { recipes: [], users: [], categories: [] };
+            const createResponse = await gapi.client.drive.files.create({
+                resource: fileMetadata,
+                media: { mimeType: 'application/json', body: JSON.stringify(initialContent, null, 2) },
+                fields: 'id',
+            });
+            return { fileId: createResponse.result.id!, data: initialContent };
+        }
+    };
+
+    const readFile = async (fileId: string): Promise<DataBundle | null> => {
+        const response = await gapi.client.drive.files.get({ fileId: fileId, alt: 'media' });
+        try {
+            return JSON.parse(response.body) as DataBundle;
+        } catch (e) {
+            console.error("Failed to parse data file:", e);
+            return null;
+        }
+    };
+
+    export const saveData = async (fileId: string, data: DataBundle): Promise<void> => {
+        const boundary = '-------314159265358979323846';
+        const delimiter = "\r\n--" + boundary + "\r\n";
+        const close_delim = "\r\n--" + boundary + "--";
+        const metadata = { name: DATA_FILE_NAME, mimeType: 'application/json' };
+        const multipartRequestBody =
+            delimiter + 'Content-Type: application/json\r\n\r\n' + JSON.stringify(metadata) +
+            delimiter + 'Content-Type: application/json\r\n\r\n' + JSON.stringify(data, null, 2) +
+            close_delim;
+        await gapi.client.request({
+            path: `/upload/drive/v3/files/${fileId}`,
+            method: 'PATCH',
+            params: { uploadType: 'multipart' },
+            headers: { 'Content-Type': 'multipart/related; boundary="' + boundary + '"' },
+            body: multipartRequestBody
+        });
+    };
+}
+
+
+// =================================================================================
+// COMPONENTS
+// =================================================================================
+const RecipeCard: React.FC<{ recipe: Recipe; onClick: () => void; }> = ({ recipe, onClick }) => {
+    const averageRating = recipe.ratings.length > 0
+        ? (recipe.ratings.reduce((acc, r) => acc + r.score, 0) / recipe.ratings.length).toFixed(1)
+        : 'N/A';
+    return (
+        <div 
+            className="w-full bg-light text-primary rounded-lg shadow-lg overflow-hidden cursor-pointer transform hover:scale-105 transition-transform duration-300"
+            onClick={onClick} role="button" tabIndex={0} onKeyPress={(e) => e.key === 'Enter' && onClick()}
+            aria-label={`Se opskriften for ${recipe.title}`}
+        >
+            <div className="relative">
+                <img src={recipe.images[0] || 'https://placehold.co/600x400/0f2d32/75fb9e?text=Billede+mangler'} alt={recipe.title} className="w-full h-48 object-cover" />
+                <div className="absolute top-0 left-0 w-full h-full bg-black bg-opacity-30 flex flex-col justify-end p-4">
+                     <div className="absolute top-2 right-2 flex items-center space-x-4 bg-primary bg-opacity-70 rounded-full px-3 py-1 text-sm">
+                        <div className="flex items-center text-light"><i className="fas fa-star text-accent mr-1"></i><span>{averageRating}</span></div>
+                        <div className="flex items-center text-light"><i className="fas fa-clock text-accent mr-1"></i><span>{recipe.prepTime} min</span></div>
+                    </div>
+                    <h3 className="text-light font-bold text-xl">{recipe.title}</h3>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// =================================================================================
+// PAGES
+// =================================================================================
+const ConfigurationPage: React.FC<{ onSave: (apiKey: string, clientId: string) => void; }> = ({ onSave }) => {
+    const [apiKey, setApiKey] = React.useState('');
+    const [clientId, setClientId] = React.useState('');
+    const handleSubmit = (e: React.FormEvent) => {
+        e.preventDefault();
+        if (apiKey && clientId) onSave(apiKey, clientId);
+        else alert('Udfyld venligst begge felter.');
+    };
+    return (
+        <div className="flex flex-col items-center justify-center min-h-screen p-4 text-light">
+            <div className="max-w-2xl w-full bg-light/10 p-8 rounded-lg shadow-2xl">
+                <h1 className="text-3xl font-bold text-center mb-4 text-accent">Opsætning af App</h1>
+                <p className="text-center mb-6 text-gray-300">For at denne app kan forbinde sikkert til dit Google Drev, skal den bruge dine personlige API-nøgler. Disse nøgler gemmes <b>kun</b> lokalt i din browser.</p>
+                <form onSubmit={handleSubmit} className="space-y-6">
+                    <div>
+                        <label htmlFor="api-key" className="block text-sm font-bold mb-2 text-gray-200">Google API Key</label>
+                        <input id="api-key" type="text" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Indtast din API Key" className="w-full p-3 bg-primary border border-gray-600 rounded-lg text-light" required />
+                    </div>
+                    <div>
+                        <label htmlFor="client-id" className="block text-sm font-bold mb-2 text-gray-200">Google Client ID</label>
+                        <input id="client-id" type="text" value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="Indtast dit Client ID" className="w-full p-3 bg-primary border border-gray-600 rounded-lg text-light" required />
+                    </div>
+                    <button type="submit" className="w-full bg-accent text-primary font-bold py-3 rounded-lg hover:bg-opacity-80 transition-colors">Gem og fortsæt</button>
+                </form>
+                <div className="mt-8 text-sm text-gray-400 border-t border-gray-700 pt-4">
+                    <h3 className="font-bold text-light mb-2">Hvorfor er dette nødvendigt?</h3>
+                    <p>Ved at bruge dine egne nøgler sikrer du, at kun du har kontrol over appens adgang. Opret nøglerne gratis på <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer" className="text-accent underline">Google Cloud Console</a>. Husk at tilføje din app-URL til de "Autoriserede JavaScript-oprindelser".</p>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const WelcomePage: React.FC<{ navigate: (page: Page, data?: any) => void; users: User[]; currentUser: User | null; onSelectUser: (user: User) => void; }> = ({ navigate, users, currentUser, onSelectUser }) => {
+    const isUserSelected = !!currentUser;
+    return (
+        <div className="flex flex-col items-center justify-center min-h-screen p-8 text-center text-light">
+            <h1 className="text-5xl font-bold mb-4">Velkommen til Mad App</h1>
+            <p className="text-xl mb-12">Find inspiration eller del dine egne mesterværker.</p>
+            <div className="flex flex-col md:flex-row space-y-4 md:space-y-0 md:space-x-6 mb-12">
+                <button onClick={() => navigate(Page.CreateRecipe)} disabled={!isUserSelected} className="bg-accent text-primary font-bold py-4 px-10 rounded-lg text-lg transition-all duration-300 shadow-lg disabled:bg-gray-500 disabled:cursor-not-allowed enabled:hover:bg-opacity-80" aria-disabled={!isUserSelected}>Opret Opskrift</button>
+                <button onClick={() => navigate(Page.FindRecipe)} disabled={!isUserSelected} className="bg-light text-primary font-bold py-4 px-10 rounded-lg text-lg transition-all duration-300 shadow-lg disabled:bg-gray-400 disabled:cursor-not-allowed enabled:hover:bg-gray-200" aria-disabled={!isUserSelected}>Hvad skal vi lave?</button>
+            </div>
+            {!isUserSelected && users.length > 0 && (<p className="text-accent text-lg mb-6 animate-pulse">Vælg din brugerprofil for at fortsætte</p>)}
+            <div className="w-full max-w-2xl">
+                <h2 className="text-2xl font-semibold mb-6">Vores Kokke</h2>
+                {users.length > 0 ? (
+                    <div className="flex justify-center flex-wrap gap-6">
+                        {users.map(user => (
+                            <div key={user.id} className={`flex flex-col items-center cursor-pointer p-2 rounded-lg transition-all duration-200 ${currentUser?.id === user.id ? 'bg-accent/20 scale-110' : 'hover:bg-light/10'}`}
+                                onClick={() => onSelectUser(user)} role="button" tabIndex={0} onKeyPress={(e) => e.key === 'Enter' && onSelectUser(user)} aria-label={`Vælg bruger ${user.name}`}>
+                                <img src={user.avatar} alt={user.name} className="w-20 h-20 rounded-full border-4 border-accent object-cover shadow-md" />
+                                <span className="mt-2 text-md font-medium">{user.name}</span>
+                            </div>
+                        ))}
+                    </div>
+                ) : (<p className="text-gray-400">Ingen brugere oprettet endnu. Gå til <a href="#/admin" className="text-accent underline">Admin-siden</a> for at oprette den første bruger.</p>)}
+            </div>
+        </div>
+    );
+};
+
+const FindRecipePage: React.FC<{ navigate: (page: Page, data?: any) => void; recipes: Recipe[]; categories: Category[]; filters: Filter; setFilters: React.Dispatch<React.SetStateAction<Filter>>; }> = ({ navigate, recipes, categories, filters, setFilters }) => {
+    const [displayedCount, setDisplayedCount] = React.useState(20);
+    const observer = React.useRef<IntersectionObserver | null>(null);
+    const timeOptions = [{ value: 'all', label: 'Alle' }, { value: '15', label: 'Under 15 min' }, { value: '30', label: 'Under 30 min' }, { value: '60', label: 'Under 60 min' }];
+    const categoryOptions = React.useMemo(() => [{ id: 'all', name: 'Alle Kategorier' }, ...categories], [categories]);
+    const filteredRecipes = React.useMemo(() => recipes.filter(recipe => (filters.category === 'all' || recipe.categoryIds.includes(filters.category)) && (filters.time === 'all' || recipe.prepTime <= parseInt(filters.time))), [recipes, filters]);
+    const lastRecipeElementRef = React.useCallback((node: HTMLDivElement) => {
+        if (observer.current) observer.current.disconnect();
+        observer.current = new IntersectionObserver(entries => {
+            if (entries[0].isIntersecting && displayedCount < filteredRecipes.length) {
+                setDisplayedCount(prevCount => prevCount + 20);
+            }
+        });
+        if (node) observer.current.observe(node);
+    }, [displayedCount, filteredRecipes.length]);
+    return (
+        <div className="p-4 md:p-8">
+            <button onClick={() => navigate(Page.Welcome)} className="mb-6 text-accent hover:underline"><i className="fas fa-arrow-left mr-2"></i>Tilbage til Velkomst</button>
+            <h1 className="text-4xl font-bold text-center mb-8 text-light">Find en Opskrift</h1>
+            <div className="flex flex-col md:flex-row justify-center items-center space-y-4 md:space-y-0 md:space-x-4 mb-8 sticky top-0 bg-primary py-4 z-10">
+                <div className="w-full md:w-auto"><label htmlFor="category-filter" className="sr-only">Kategori</label><select id="category-filter" value={filters.category} onChange={e => setFilters(prev => ({ ...prev, category: e.target.value }))} className="w-full bg-light text-primary p-3 rounded-lg shadow">{categoryOptions.map(cat => <option key={cat.id} value={cat.id}>{cat.name}</option>)}</select></div>
+                <div className="w-full md:w-auto"><label htmlFor="time-filter" className="sr-only">Tilberedningstid</label><select id="time-filter" value={filters.time} onChange={e => setFilters(prev => ({ ...prev, time: e.target.value }))} className="w-full bg-light text-primary p-3 rounded-lg shadow">{timeOptions.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}</select></div>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                {filteredRecipes.slice(0, displayedCount).map((recipe, index) => {
+                    const props = { key: recipe.id, recipe: recipe, onClick: () => navigate(Page.RecipeDetail, { recipe }) };
+                    if (index === displayedCount - 1) return <div ref={lastRecipeElementRef}><RecipeCard {...props} /></div>;
+                    return <RecipeCard {...props} />;
+                })}
+            </div>
+            {recipes.length > 0 && filteredRecipes.length === 0 && <p className="text-center text-light mt-8">Ingen opskrifter fundet med de valgte filtre.</p>}
+            {recipes.length === 0 && <p className="text-center text-light mt-8">Der er ingen opskrifter endnu. Opret den første!</p>}
+        </div>
+    );
+};
+
+const RecipeDetailPage: React.FC<{ recipe: Recipe; currentUser: User | null; onToggleFavorite: (recipeId: string) => void; onRate: (recipeId: string, rating: number) => void; navigate: (page: Page, data?: any) => void; }> = ({ recipe, currentUser, onToggleFavorite, onRate, navigate }) => {
+    const [userRating, setUserRating] = React.useState<number | undefined>(undefined);
+    React.useEffect(() => { setUserRating(currentUser ? recipe.ratings.find(r => r.userId === currentUser.id)?.score : undefined); }, [recipe, currentUser]);
+    const averageRating = recipe.ratings.length > 0 ? (recipe.ratings.reduce((acc, r) => acc + r.score, 0) / recipe.ratings.length).toFixed(1) : 'N/A';
+    const isFavorite = currentUser ? currentUser.favorites.includes(recipe.id) : false;
+    const handleRating = (score: number) => { if (currentUser) { setUserRating(score); onRate(recipe.id, score); } };
+    return (
+        <div className="bg-primary text-light min-h-screen">
+            <div className="relative">
+                <img src={recipe.images[0] || 'https://placehold.co/600x400/0f2d32/75fb9e?text=Billede+mangler'} alt={recipe.title} className="w-full h-64 md:h-96 object-cover" />
+                <div className="absolute top-0 left-0 w-full h-full bg-gradient-to-t from-primary to-transparent"></div>
+                <div className="absolute bottom-0 left-0 p-4 md:p-8"><h1 className="text-4xl md:text-5xl font-bold text-light">{recipe.title}</h1></div>
+                {currentUser && (<button onClick={() => onToggleFavorite(recipe.id)} className="absolute top-4 right-4 text-3xl text-light drop-shadow-lg" aria-label={isFavorite ? 'Fjern fra favoritter' : 'Tilføj til favoritter'}><i className={`fa-heart ${isFavorite ? 'fa-solid text-accent' : 'fa-regular'}`}></i></button>)}
+            </div>
+            <div className="p-4 md:p-8">
+                <div className="flex items-center flex-wrap gap-x-6 gap-y-2 border-b border-gray-700 pb-4 mb-6">
+                    <div className="flex items-center text-lg"><i className="fas fa-star text-accent mr-2"></i><span>{averageRating} / 10 ({recipe.ratings.length} stemmer)</span></div>
+                    <div className="flex items-center text-lg"><i className="fas fa-clock text-accent mr-2"></i><span>{recipe.prepTime} minutter</span></div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                    <div className="md:col-span-1"><h2 className="text-2xl font-bold mb-4 text-accent">Ingredienser</h2><ul className="space-y-2">{recipe.ingredients.map(ing => (<li key={ing.id} className="flex justify-between"><span>{ing.name}</span><span className="text-gray-400">{ing.amount}</span></li>))}</ul></div>
+                    <div className="md:col-span-2"><h2 className="text-2xl font-bold mb-4 text-accent">Fremgangsmåde</h2><p className="whitespace-pre-wrap leading-relaxed">{recipe.instructions}</p>{recipe.notes && (<> <h3 className="text-xl font-bold mt-6 mb-2 text-accent">Noter</h3><p className="text-gray-300 italic">{recipe.notes}</p></>)}</div>
+                </div>
+                {currentUser && (<div className="mt-8 border-t border-gray-700 pt-6"><h3 className="text-xl font-bold mb-4 text-center text-accent">Giv din bedømmelse</h3><div className="flex justify-center items-center space-x-1 md:space-x-2 flex-wrap gap-y-2">{[...Array(11).keys()].map(i => (<button key={i} onClick={() => handleRating(i)} className={`w-10 h-10 rounded-full flex items-center justify-center font-bold transition-colors duration-200 ${userRating === i ? 'bg-accent text-primary' : 'bg-gray-700 text-light hover:bg-accent hover:text-primary'}`} aria-label={`Giv bedømmelsen ${i}`}>{i}</button>))}</div></div>)}
+                <div className="mt-12 flex flex-col md:flex-row justify-center space-y-4 md:space-y-0 md:space-x-4"><button onClick={() => navigate(Page.FindRecipe)} className="bg-gray-700 text-light font-bold py-3 px-6 rounded-lg hover:bg-gray-600 transition-colors"><i className="fas fa-arrow-left mr-2"></i> Tilbage til Opskrifter</button>{currentUser && (<button onClick={() => navigate(Page.CreateRecipe, { recipe })} className="bg-accent text-primary font-bold py-3 px-6 rounded-lg hover:bg-opacity-80 transition-colors"><i className="fas fa-edit mr-2"></i> Rediger Opskrift</button>)}</div>
+            </div>
+        </div>
+    );
+};
+
+const CreateRecipePage: React.FC<{ onSave: (recipe: Recipe) => void; navigate: (page: Page, data?: any) => void; existingRecipe?: Recipe | null; categories: Category[]; currentUser: User | null; }> = ({ onSave, navigate, existingRecipe, categories, currentUser }) => {
+    const [title, setTitle] = React.useState('');
+    const [images, setImages] = React.useState<string[]>(['']);
+    const [prepTime, setPrepTime] = React.useState(30);
+    const [ingredients, setIngredients] = React.useState<Ingredient[]>([{ id: `ing-${Date.now()}`, name: '', amount: '' }]);
+    const [instructions, setInstructions] = React.useState('');
+    const [notes, setNotes] = React.useState('');
+    const [selectedCategories, setSelectedCategories] = React.useState<string[]>([]);
+
+    React.useEffect(() => {
+        if (existingRecipe) {
+            setTitle(existingRecipe.title); setImages(existingRecipe.images.length > 0 ? existingRecipe.images : ['']); setPrepTime(existingRecipe.prepTime); setIngredients(existingRecipe.ingredients);
+            setInstructions(existingRecipe.instructions); setNotes(existingRecipe.notes || ''); setSelectedCategories(existingRecipe.categoryIds);
+        }
+    }, [existingRecipe]);
+    React.useEffect(() => { if (!currentUser) { alert("Du skal vælge en brugerprofil for at kunne oprette eller redigere."); navigate(Page.Welcome); } }, [currentUser, navigate]);
+    
+    const handleAddIngredient = () => setIngredients([...ingredients, { id: `ing-${Date.now()}`, name: '', amount: '' }]);
+    const handleIngredientChange = (index: number, field: 'name' | 'amount', value: string) => { const newIngredients = [...ingredients]; newIngredients[index] = { ...newIngredients[index], [field]: value }; setIngredients(newIngredients); };
+    const handleRemoveIngredient = (index: number) => setIngredients(ingredients.filter((_, i) => i !== index));
+    const handleCategoryToggle = (categoryId: string) => setSelectedCategories(prev => prev.includes(categoryId) ? prev.filter(id => id !== categoryId) : [...prev, categoryId]);
+    
+    const handleSave = () => {
+        if (!currentUser) return alert('Vælg venligst en brugerprofil først.');
+        if (!title || !instructions || ingredients.some(i => !i.name)) return alert('Udfyld venligst titel, fremgangsmåde og alle ingrediensnavne.');
+        const recipeToSave: Recipe = {
+            id: existingRecipe?.id || `recipe-${Date.now()}`, title, images, prepTime,
+            ingredients: ingredients.filter(i => i.name.trim() !== ''), instructions, notes,
+            categoryIds: selectedCategories, authorId: existingRecipe?.authorId || currentUser.id,
+            ratings: existingRecipe?.ratings || [],
+        };
+        onSave(recipeToSave);
+    };
+    
+    return (
+        <div className="p-4 md:p-8 max-w-4xl mx-auto">
+             <button onClick={() => navigate(Page.Welcome)} className="mb-6 text-accent hover:underline"><i className="fas fa-arrow-left mr-2"></i>Tilbage til Velkomst</button>
+            <h1 className="text-4xl font-bold text-center mb-8 text-light">{existingRecipe ? 'Rediger Opskrift' : 'Opret ny Opskrift'}</h1>
+            <div className="space-y-6 bg-light text-primary p-6 rounded-lg shadow-xl">
+                <div><label className="block text-lg font-bold mb-2" htmlFor="title">Titel</label><input id="title" type="text" value={title} onChange={e => setTitle(e.target.value)} className="w-full p-3 border border-gray-300 rounded-lg"/></div>
+                <div><label className="block text-lg font-bold mb-2">Billeder</label><div className="flex items-center space-x-4"><img src={images[0] || 'https://placehold.co/400x400/0f2d32/75fb9e?text=Billede'} alt="Recipe" className="w-32 h-32 object-cover rounded-lg" /><div><input type="text" placeholder="Indsæt billed-URL" value={images[0]} onChange={(e) => setImages([e.target.value])} className="w-full p-2 border border-gray-300 rounded-lg mb-2" /><p className="text-sm text-gray-500">Indsæt en URL til et billede.</p></div></div></div>
+                <div><label className="block text-lg font-bold mb-2" htmlFor="prepTime">Arbejdstid (minutter)</label><input id="prepTime" type="number" value={prepTime} onChange={e => setPrepTime(parseInt(e.target.value, 10))} className="w-full p-3 border border-gray-300 rounded-lg"/></div>
+                <div><h3 className="text-lg font-bold mb-2">Ingredienser</h3>{ingredients.map((ing, index) => (<div key={ing.id} className="flex items-center space-x-2 mb-2"><input type="text" placeholder="Mængde" value={ing.amount} onChange={e => handleIngredientChange(index, 'amount', e.target.value)} className="w-1/3 p-2 border border-gray-300 rounded-lg" /><input type="text" placeholder="Ingrediens" value={ing.name} onChange={e => handleIngredientChange(index, 'name', e.target.value)} className="w-2/3 p-2 border border-gray-300 rounded-lg" /><button onClick={() => handleRemoveIngredient(index)} className="text-red-500 hover:text-red-700 p-2"><i className="fas fa-trash"></i></button></div>))}<button onClick={handleAddIngredient} className="mt-2 bg-primary text-light font-bold py-2 px-4 rounded-lg hover:bg-opacity-90">+ Tilføj ingrediens</button></div>
+                <div><label className="block text-lg font-bold mb-2" htmlFor="instructions">Fremgangsmåde</label><textarea id="instructions" value={instructions} onChange={e => setInstructions(e.target.value)} rows={8} className="w-full p-3 border border-gray-300 rounded-lg"/></div>
+                <div><label className="block text-lg font-bold mb-2" htmlFor="notes">Noter (valgfri)</label><textarea id="notes" value={notes} onChange={e => setNotes(e.target.value)} rows={3} className="w-full p-3 border border-gray-300 rounded-lg"/></div>
+                <div><h3 className="text-lg font-bold mb-2">Kategorier</h3><div className="flex flex-wrap gap-2">{categories.map(cat => (<button key={cat.id} onClick={() => handleCategoryToggle(cat.id)} className={`py-2 px-4 rounded-full font-semibold transition-colors ${selectedCategories.includes(cat.id) ? 'bg-accent text-primary' : 'bg-gray-200 text-gray-700'}`}>{cat.name}</button>))}</div></div>
+                <div className="flex justify-end space-x-4 pt-6"><button onClick={() => navigate(existingRecipe ? Page.RecipeDetail : Page.Welcome, {recipe: existingRecipe})} className="bg-gray-500 text-white font-bold py-3 px-6 rounded-lg hover:bg-gray-600 transition-colors">Annuller</button><button onClick={handleSave} className="bg-accent text-primary font-bold py-3 px-6 rounded-lg hover:bg-opacity-80 transition-colors">Gem Opskrift</button></div>
+            </div>
+        </div>
+    );
+};
+
+const UserPage: React.FC<{ user: User; favoriteRecipes: Recipe[]; navigate: (page: Page, data?: any) => void; categories: Category[]; }> = ({ user, favoriteRecipes, navigate, categories }) => {
+    const [filter, setFilter] = React.useState('all');
+    const filteredFavorites = React.useMemo(() => (filter === 'all' ? favoriteRecipes : favoriteRecipes.filter(r => r.categoryIds.includes(filter))), [filter, favoriteRecipes]);
+    const categoryOptions = React.useMemo(() => {
+        const favCatIds = new Set(favoriteRecipes.flatMap(r => r.categoryIds));
+        return [{id: 'all', name: 'Alle Favoritter'}, ...categories.filter(c => favCatIds.has(c.id))];
+    }, [favoriteRecipes, categories]);
+    return (
+        <div className="p-4 md:p-8">
+            <button onClick={() => navigate(Page.Welcome)} className="mb-6 text-accent hover:underline"><i className="fas fa-arrow-left mr-2"></i>Tilbage til Velkomst</button>
+            <div className="flex flex-col items-center mb-8"><img src={user.avatar} alt={user.name} className="w-32 h-32 rounded-full border-4 border-accent object-cover shadow-lg mb-4"/><h1 className="text-4xl font-bold text-light">{user.name}s Favoritter</h1></div>
+            {favoriteRecipes.length > 0 && (<div className="flex justify-center mb-8"><select value={filter} onChange={e => setFilter(e.target.value)} className="bg-light text-primary p-3 rounded-lg shadow">{categoryOptions.map(cat => <option key={cat.id} value={cat.id}>{cat.name}</option>)}</select></div>)}
+            {filteredFavorites.length > 0 ? (<div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">{filteredFavorites.map(recipe => (<RecipeCard key={recipe.id} recipe={recipe} onClick={() => navigate(Page.RecipeDetail, { recipe })} />))}</div>) : (<p className="text-center text-light mt-8">{user.name} har endnu ikke tilføjet nogen favoritter.</p>)}
+        </div>
+    );
+};
+
+const AdminPage: React.FC<{ users: User[]; categories: Category[]; onSaveUser: (user: User) => void; onSaveCategory: (category: Category) => void; }> = ({ users, categories, onSaveUser, onSaveCategory }) => {
+    const [newUserName, setNewUserName] = React.useState('');
+    const [newUserAvatar, setNewUserAvatar] = React.useState('');
+    const [newCategoryName, setNewCategoryName] = React.useState('');
+    const handleCreateUser = (e: React.FormEvent) => { e.preventDefault(); if (!newUserName) return; onSaveUser({ id: `user-${Date.now()}`, name: newUserName, avatar: newUserAvatar || `https://i.pravatar.cc/100?u=${newUserName}`, favorites: [] }); setNewUserName(''); setNewUserAvatar(''); };
+    const handleCreateCategory = (e: React.FormEvent) => { e.preventDefault(); if (!newCategoryName) return; onSaveCategory({ id: `cat-${Date.now()}`, name: newCategoryName }); setNewCategoryName(''); };
+    return (
+        <div className="p-4 md:p-8 max-w-5xl mx-auto text-light">
+             <a href="#" onClick={(e) => { e.preventDefault(); window.history.back(); }} className="mb-6 text-accent hover:underline"><i className="fas fa-arrow-left mr-2"></i>Tilbage</a>
+            <h1 className="text-4xl font-bold text-center mb-8">Admin Panel</h1>
+            <p className="text-center text-gray-400 mb-12">Her kan du tilføje brugere og kategorier til appen.</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div className="bg-light/10 p-6 rounded-lg"><h2 className="text-2xl font-bold mb-4 text-accent">Brugeradministration</h2><form onSubmit={handleCreateUser} className="mb-6 space-y-4"><input type="text" placeholder="Ny brugers navn" value={newUserName} onChange={e => setNewUserName(e.target.value)} className="w-full p-3 bg-primary border border-gray-600 rounded-lg text-light" required /><input type="text" placeholder="Avatar URL (valgfri)" value={newUserAvatar} onChange={e => setNewUserAvatar(e.target.value)} className="w-full p-3 bg-primary border border-gray-600 rounded-lg text-light" /><button type="submit" className="w-full bg-accent text-primary font-bold py-3 rounded-lg hover:bg-opacity-80 transition-colors">Opret Bruger</button></form><h3 className="text-xl font-semibold mb-3">Eksisterende Brugere</h3><ul className="space-y-2 max-h-60 overflow-y-auto">{users.map(user => (<li key={user.id} className="flex items-center bg-primary p-2 rounded"><img src={user.avatar} alt={user.name} className="w-10 h-10 rounded-full mr-4 object-cover"/><span>{user.name}</span></li>))}</ul></div>
+                <div className="bg-light/10 p-6 rounded-lg"><h2 className="text-2xl font-bold mb-4 text-accent">Kategoriadministration</h2><form onSubmit={handleCreateCategory} className="mb-6 space-y-4"><input type="text" placeholder="Ny kategori" value={newCategoryName} onChange={e => setNewCategoryName(e.target.value)} className="w-full p-3 bg-primary border border-gray-600 rounded-lg text-light" required /><button type="submit" className="w-full bg-accent text-primary font-bold py-3 rounded-lg hover:bg-opacity-80 transition-colors">Opret Kategori</button></form><h3 className="text-xl font-semibold mb-3">Eksisterende Kategorier</h3><ul className="space-y-2 max-h-60 overflow-y-auto">{categories.map(category => (<li key={category.id} className="bg-primary p-2 rounded">{category.name}</li>))}</ul></div>
+            </div>
+        </div>
+    );
+};
+
+// =================================================================================
+// MAIN APP COMPONENT
+// =================================================================================
+const App: React.FC = () => {
+    const [isConfigured, setIsConfigured] = React.useState(false);
+    const [isDriveReady, setIsDriveReady] = React.useState(false);
+    const [isLoggedIn, setIsLoggedIn] = React.useState(false);
+    const [isLoading, setIsLoading] = React.useState(true);
+    const [error, setError] = React.useState<string | null>(null);
+    const [fileId, setFileId] = React.useState<string | null>(null);
+
+    const [recipes, setRecipes] = React.useState<Recipe[]>([]);
+    const [users, setUsers] = React.useState<User[]>([]);
+    const [categories, setCategories] = React.useState<Category[]>([]);
+    
+    const [currentPage, setCurrentPage] = React.useState<Page>(Page.Welcome);
+    const [selectedRecipe, setSelectedRecipe] = React.useState<Recipe | null>(null);
+    const [selectedUser, setSelectedUser] = React.useState<User | null>(null); 
+    const [editingRecipe, setEditingRecipe] = React.useState<Recipe | null>(null);
+    const [findRecipeFilters, setFindRecipeFilters] = React.useState<Filter>({ category: 'all', time: 'all' });
+
+    React.useEffect(() => {
+        const storedApiKey = localStorage.getItem('btmad_apiKey');
+        const storedClientId = localStorage.getItem('btmad_clientId');
+        if (storedApiKey && storedClientId) {
+            driveService.configure({ apiKey: storedApiKey, clientId: storedClientId });
+            setIsConfigured(true);
+        } else {
+            setIsLoading(false);
+        }
+    }, []);
+
+    const handleSaveConfig = (apiKey: string, clientId: string) => {
+        localStorage.setItem('btmad_apiKey', apiKey);
+        localStorage.setItem('btmad_clientId', clientId);
+        driveService.configure({ apiKey, clientId });
+        setIsConfigured(true);
+        setIsLoading(true);
+    };
+    
+    React.useEffect(() => {
+        if (!isConfigured) return;
+        const init = async () => {
+            try {
+                await driveService.initClient((loggedIn) => {
+                    setIsDriveReady(true);
+                    setIsLoggedIn(loggedIn);
+                    if (!loggedIn) setIsLoading(false);
+                });
+            } catch (err) {
+                console.error("Init error", err);
+                setError("Kunne ikke initialisere. Tjek dine API-nøgler.");
+                setIsLoading(false);
+            }
+        };
+        init();
+    }, [isConfigured]);
+    
+    React.useEffect(() => {
+        if (!isLoggedIn || !isDriveReady) return;
+        const loadData = async () => {
+            setIsLoading(true); setError(null);
+            try {
+                const { fileId: foundFileId, data } = await driveService.findOrCreateDataFile();
+                setFileId(foundFileId);
+                if (data) {
+                    setRecipes(data.recipes || []);
+                    setUsers(data.users || []);
+                    setCategories(data.categories || []);
+                }
+            } catch (err) {
+                console.error("Load error", err);
+                setError("Kunne ikke hente data. Har du delt filen korrekt?");
+            } finally {
+                setIsLoading(false);
+            }
+        };
+        loadData();
+    }, [isLoggedIn, isDriveReady]);
+
+    const saveData = React.useCallback(async (newData: Partial<DataBundle>) => {
+        if (!fileId) return setError("Kan ikke gemme: Ingen datafil fundet.");
+        const fullData: DataBundle = {
+            recipes: newData.recipes !== undefined ? newData.recipes : recipes,
+            users: newData.users !== undefined ? newData.users : users,
+            categories: newData.categories !== undefined ? newData.categories : categories,
+        };
+        try {
+            await driveService.saveData(fileId, fullData);
+        } catch (e) {
+            console.error("Save error", e);
+            setError("Der skete en fejl under gem. Prøv igen.");
+        }
+    }, [fileId, recipes, users, categories]);
+
+    const handleLogin = React.useCallback(() => {
+        driveService.requestToken(() => setIsLoggedIn(true));
+    }, []);
+
+    React.useEffect(() => {
+        const handleHashChange = () => { if (window.location.hash === '#/admin') setCurrentPage(Page.Admin); };
+        window.addEventListener('hashchange', handleHashChange, false);
+        handleHashChange();
+        return () => window.removeEventListener('hashchange', handleHashChange, false);
+    }, []);
+
+    const navigate = (page: Page, data?: any) => {
+        if (page === Page.RecipeDetail && data?.recipe) setSelectedRecipe(data.recipe);
+        if (page === Page.User && data?.user) setSelectedUser(data.user);
+        if (page === Page.CreateRecipe && data?.recipe) setEditingRecipe(data.recipe);
+        else setEditingRecipe(null);
+        setCurrentPage(page);
+    };
+
+    const handleSaveRecipe = (recipe: Recipe) => {
+        const existingIndex = recipes.findIndex(r => r.id === recipe.id);
+        const updatedRecipes = existingIndex > -1 ? recipes.map(r => r.id === recipe.id ? recipe : r) : [recipe, ...recipes];
+        setRecipes(updatedRecipes);
+        saveData({ recipes: updatedRecipes });
+        navigate(Page.RecipeDetail, { recipe });
+    };
+
+    const handleToggleFavorite = React.useCallback((recipeId: string) => {
+        if (!selectedUser) return;
+        const isFavorite = selectedUser.favorites.includes(recipeId);
+        const updatedFavorites = isFavorite ? selectedUser.favorites.filter(id => id !== recipeId) : [...selectedUser.favorites, recipeId];
+        const updatedUser = { ...selectedUser, favorites: updatedFavorites };
+        const updatedUsers = users.map(u => u.id === updatedUser.id ? updatedUser : u);
+        setUsers(updatedUsers);
+        setSelectedUser(updatedUser);
+        saveData({ users: updatedUsers });
+    }, [selectedUser, users, saveData]);
+
+    const handleRateRecipe = (recipeId: string, rating: number) => {
+        const recipe = recipes.find(r => r.id === recipeId);
+        if (!recipe || !selectedUser) return;
+        const newRating = { userId: selectedUser.id, score: rating };
+        const existingRatingIndex = recipe.ratings.findIndex(r => r.userId === selectedUser.id);
+        const updatedRatings = [...recipe.ratings];
+        if (existingRatingIndex > -1) updatedRatings[existingRatingIndex] = newRating;
+        else updatedRatings.push(newRating);
+        const updatedRecipe = { ...recipe, ratings: updatedRatings };
+        const updatedRecipes = recipes.map(r => r.id === recipeId ? updatedRecipe : r);
+        setRecipes(updatedRecipes);
+        setSelectedRecipe(updatedRecipe);
+        saveData({ recipes: updatedRecipes });
+    };
+
+    const handleSaveUser = (user: User) => { const u = [...users, user]; setUsers(u); saveData({ users: u }); };
+    const handleSaveCategory = (category: Category) => { const c = [...categories, category]; setCategories(c); saveData({ categories: c }); };
+    
+    if (isLoading) {
+        return <div className="flex items-center justify-center min-h-screen text-light"><i className="fas fa-spinner fa-spin text-4xl text-accent"></i><p className="ml-4 text-lg">Indlæser...</p></div>;
+    }
+    if (!isConfigured) return <ConfigurationPage onSave={handleSaveConfig} />;
+    if (!isLoggedIn) {
+        return <div className="flex flex-col items-center justify-center min-h-screen p-8 text-center text-light"><h1 className="text-5xl font-bold mb-4">Velkommen til Mad App</h1><p className="text-xl mb-12">Log ind med Google for at hente dine opskrifter.</p><button onClick={handleLogin} className="bg-accent text-primary font-bold py-4 px-10 rounded-lg text-lg hover:bg-opacity-80 transition-colors shadow-lg"><i className="fab fa-google mr-3"></i> Log ind med Google</button></div>;
+    }
+    if (error) {
+        return <div className="p-8 text-center text-red-400"><h2 className="text-2xl font-bold">Der opstod en fejl</h2><p className="mt-2">{error}</p><button onClick={() => { localStorage.clear(); window.location.reload(); }} className="mt-4 bg-accent text-primary font-bold py-2 px-4 rounded-lg">Nulstil og prøv igen</button></div>
+    }
+
+    const renderPage = () => {
+        switch (currentPage) {
+            case Page.Welcome: return <WelcomePage navigate={navigate} users={users} onSelectUser={setSelectedUser} currentUser={selectedUser} />;
+            case Page.FindRecipe: return <FindRecipePage navigate={navigate} recipes={recipes} categories={categories} filters={findRecipeFilters} setFilters={setFindRecipeFilters} />;
+            case Page.RecipeDetail: return selectedRecipe ? <RecipeDetailPage recipe={selectedRecipe} currentUser={selectedUser} onToggleFavorite={handleToggleFavorite} onRate={handleRateRecipe} navigate={navigate} /> : <WelcomePage navigate={navigate} users={users} onSelectUser={setSelectedUser} currentUser={selectedUser} />;
+            case Page.CreateRecipe: return <CreateRecipePage onSave={handleSaveRecipe} navigate={navigate} existingRecipe={editingRecipe} categories={categories} currentUser={selectedUser} />;
+            case Page.User: return selectedUser ? <UserPage user={selectedUser} favoriteRecipes={recipes.filter(r => selectedUser.favorites.includes(r.id))} navigate={navigate} categories={categories} /> : <WelcomePage navigate={navigate} users={users} onSelectUser={setSelectedUser} currentUser={selectedUser} />;
+            case Page.Admin: return <AdminPage onSaveUser={handleSaveUser} onSaveCategory={handleSaveCategory} categories={categories} users={users} />;
+            default: return <WelcomePage navigate={navigate} users={users} onSelectUser={setSelectedUser} currentUser={selectedUser} />;
+        }
+    };
+    return <div className="min-h-screen bg-primary font-sans">{renderPage()}</div>;
+};
+
+// =================================================================================
+// RENDER THE APP
+// =================================================================================
+const rootElement = document.getElementById('root');
+if (rootElement) {
+  const root = ReactDOM.createRoot(rootElement);
+  root.render(<App />);
+} else {
+  console.error('Fatal error: Root element not found!');
+}
+
+    </script>
+</body>
+</html>
